@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data + outputs
+data/*.db
+reports/figures/*.csv
+reports/figures/*.png
+
+# OS files
+.DS_Store
