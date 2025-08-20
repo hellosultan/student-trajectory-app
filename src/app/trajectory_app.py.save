@@ -1,0 +1,194 @@
+
+
+#!/usr/bin/env python
+"""
+Student Trajectory App
+Explore a student's journey: enrolment → attendance → LMS activity → assessments → outcome.
+Uses the SQLite DB built by src/sql/load_to_sqlite.py.
+"""
+import os, sqlite3
+import pandas as pd
+import streamlit as st
+import altair as alt
+
+DB_PATH = os.path.join("data","engagement.db")
+
+# ----------------- Data helpers -----------------
+@st.cache_data(show_spinner=False)
+def load_sql(query: str, params: tuple = ()):
+    con = sqlite3.connect(DB_PATH)
+    try:
+        return pd.read_sql_query(query, con, params=params)
+    finally:
+        con.close()
+
+@st.cache_data(show_spinner=False)
+def list_students(q=None, program=None, intake=None):
+    where, params = [], []
+    if q:
+        where.append("(full_name LIKE ? OR CAST(student_id AS TEXT)=?)")
+        params.extend([f"%{q}%", q])
+    if program and program != "All":
+        where.append("program = ?"); params.append(program)
+    if intake and intake != "All":
+        where.append("intake = ?"); params.append(intake)
+    clause = ("WHERE " + " AND ".join(where)) if where else ""
+    return load_sql(f"SELECT student_id, full_name, program, intake, enrol_date FROM students {clause} ORDER BY full_name ASC;", tuple(params))
+
+@st.cache_data(show_spinner=False)
+def student_profile(student_id: int):
+    s = load_sql("SELECT * FROM students WHERE student_id = ?;", (student_id,))
+    ast = load_sql("SELECT * FROM analytic_student_term WHERE student_id = ? ORDER BY term;", (student_id,))
+    att = load_sql("SELECT week, term, sessions, attended FROM attendance WHERE student_id = ? ORDER BY term, week;", (student_id,))
+    lms = load_sql("SELECT activity_date, clicks FROM lms_activity WHERE student_id = ? ORDER BY activity_date;", (student_id,))
+    ev  = load_sql("SELECT event_type, event_date, term, details FROM student_events WHERE student_id = ? ORDER BY event_date;", (student_id,))
+    # cast dates
+    if not lms.empty:
+        lms["activity_date"] = pd.to_datetime(lms["activity_date"])
+    if not ev.empty:
+        ev["event_date"] = pd.to_datetime(ev["event_date"])
+    return (s.iloc[0] if not s.empty else None), ast, att, lms, ev
+
+# ----------------- UI -----------------
+def main():
+    st.set_page_config(page_title="Student Trajectory", page_icon="🎓", layout="wide")
+    st.title("🎓 Student Trajectory Explorer")
+    st.caption("Synthetic demo DB (deterministic RNG=42). Use the sidebar to filter and pick a student.")
+
+    # quick sanity
+    if not os.path.exists(DB_PATH):
+        st.error("Database not found at data/engagement.db. Run: `python src/sql/load_to_sqlite.py`")
+        st.stop()
+
+    # Sidebar filters
+    st.sidebar.header("Filters")
+    df_students_all = load_sql("SELECT DISTINCT program FROM students ORDER BY program;")
+    programs = ["All"] + df_students_all["program"].tolist()
+
+    df_intakes_all = load_sql("SELECT DISTINCT intake FROM students ORDER BY intake;")
+    intakes = ["All"] + df_intakes_all["intake"].tolist()
+
+    program = st.sidebar.selectbox("Program", programs, index=0)
+    intake  = st.sidebar.selectbox("Intake", intakes, index=0)
+    query   = st.sidebar.text_input("Search name or ID")
+
+    matches = list_students(query if query else None, program, intake)
+    st.sidebar.write(f"Matches: **{len(matches)}**")
+
+    sid = None
+    if not matches.empty:
+        # nice label
+        matches["label"] = matches["student_id"].astype(str) + " — " + matches["full_name"]
+        chosen = st.sidebar.selectbox("Choose student", matches["label"].tolist())
+        sid = int(chosen.split(" — ")[0])
+
+    # Cohort snapshot
+    with st.expander("Cohort snapshot (current filters)"):
+        cohort = load_sql("SELECT * FROM analytic_student_term;")
+        if program != "All":
+            cohort = cohort[cohort["program"] == program]
+        if intake != "All":
+            cohort = cohort[cohort["intake"] == intake]
+        k1,k2,k3,k4,k5 = st.columns(5)
+        with k1: st.metric("Students", f"{cohort['student_id'].nunique():,}")
+        with k2: st.metric("Avg Attendance", f"{cohort['attendance_rate'].mean():.1%}")
+        with k3: st.metric("Avg Activity Decile", f"{cohort['activity_decile'].mean():.1f}")
+        with k4: st.metric("Avg Midterm", f"{cohort['midterm'].mean():.1f}")
+        with k5: st.metric("At-Risk %", f"{cohort['at_risk'].mean():.1%}")
+        st.dataframe(
+            cohort[["student_id","term","attendance_rate","clicks","midterm","final","at_risk"]]
+            .sort_values(["student_id","term"])
+        )
+        st.download_button("Download cohort CSV",
+                           cohort.to_csv(index=False).encode("utf-8"),
+                           file_name="cohort_snapshot.csv",
+                           mime="text/csv")
+
+    if sid is None:
+        st.info("Pick a student from the sidebar to see their full trajectory.")
+        st.stop()
+
+    # Student profile + KPIs
+    student, ast, att, lms, ev = student_profile(sid)
+    if student is None:
+        st.warning("Student not found.")
+        st.stop()
+
+    st.subheader(f"{student['full_name']}  ·  ID {int(student['student_id'])}")
+    st.caption(f"{student['program']} · Intake {student['intake']} · Enrolled {student['enrol_date']}")
+
+    latest = ast.sort_values("term").tail(1)
+    c1,c2,c3,c4,c5 = st.columns(5)
+    with c1: st.metric("Attendance", f"{latest['attendance_rate'].iloc[0]:.1%}")
+    with c2: st.metric("Activity Decile", f"{latest['activity_decile'].iloc[0]:.0f}/10")
+    with c3: st.metric("On-time Submissions", f"{latest['on_time_rate'].iloc[0]:.1%}")
+    with c4: st.metric("Midterm", f"{latest['midterm'].iloc[0]:.1f}")
+    with c5: st.metric("Final", f"{latest['final'].iloc[0]:.1f}")
+
+    # Timeline chart
+    if not ev.empty:
+        timeline = alt.Chart(ev).mark_circle(size=120).encode(
+            x=alt.X('event_date:T', title="Date"),
+            y=alt.value(0),
+            color=alt.Color('event_type:N', legend=alt.Legend(title="Event")),
+            tooltip=['event_type','event_date','term','details']
+        ).properties(height=90)
+        rules = alt.Chart(ev).mark_rule().encode(x='event_date:T').properties(height=90)
+        st.altair_chart(timeline + rules, use_container_width=True)
+    else:
+        st.caption("No events recorded.")
+
+    # Attendance over weeks
+    if not att.empty:
+        att_plot = att.copy()
+        att_plot["pct"] = att_plot["attended"] / att_plot["sessions"]
+        chart_att = alt.Chart(att_plot).mark_line(point=True).encode(
+            x=alt.X('week:O', title='Teaching Week'),
+            y=alt.Y('pct:Q', title='Attendance %', scale=alt.Scale(domain=[0,1])),
+            color='term:N',
+            tooltip=['term','week','attended','sessions','pct']
+        ).properties(title="Weekly Attendance", height=280)
+        st.altair_chart(chart_att, use_container_width=True)
+
+    # LMS activity daily & rolling 7-day
+    if not lms.empty:
+        l = lms.copy().sort_values("activity_date")
+        l["activity_date"] = pd.to_datetime(l["activity_date"])
+        l["rolling_7d"] = l["clicks"].rolling(7, min_periods=1).sum()
+        long = l.melt(id_vars=["activity_date"], value_vars=["clicks","rolling_7d"],
+                      var_name="metric", value_name="value")
+        chart_lms = alt.Chart(long).mark_line().encode(
+            x=alt.X('activity_date:T', title='Date'),
+            y=alt.Y('value:Q', title='Clicks'),
+            color='metric:N',
+            tooltip=['activity_date:T','metric:N','value:Q']
+        ).properties(title="LMS Activity (Daily & 7-day rolling)", height=280)
+        st.altair_chart(chart_lms, use_container_width=True)
+
+    # Assessment by term
+    if not ast.empty:
+        long_scores = ast.melt(id_vars=["term"], value_vars=["midterm","final"],
+                               var_name="assessment", value_name="score")
+        chart_scores = alt.Chart(long_scores).mark_bar().encode(
+            x=alt.X('term:N', title="Term"),
+            y=alt.Y('score:Q', title="Score"),
+            color='assessment:N',
+            tooltip=['term','assessment','score']
+        ).properties(title="Assessment Scores by Term", height=280)
+        st.altair_chart(chart_scores, use_container_width=True)
+
+    # Raw data export
+    with st.expander("Raw data (this student)"):
+        st.dataframe(ast.sort_values("term"))
+        st.download_button("Download student-term CSV",
+                           ast.sort_values("term").to_csv(index=False).encode("utf-8"),
+                           file_name=f"student_{int(student['student_id'])}_terms.csv",
+                           mime="text/csv")
+
+if __name__ == "__main__":
+    # Auto-build DB if missing (convenience)
+    if not os.path.exists(DB_PATH):
+        os.makedirs("data", exist_ok=True)
+        import subprocess
+        subprocess.run(["python","src/sql/load_to_sqlite.py"], check=True)
+    main()
